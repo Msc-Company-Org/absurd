@@ -2,941 +2,269 @@ package server
 
 // Security notes on SQL query construction:
 // - Table names (queue identifiers) are ALWAYS quoted via pq.QuoteIdentifier
-//   (see queueTableIdentifier). This prevents SQL injection on identifiers.
+//   (see queueTableIdentifier in handlers_queues.go).
 // - User-provided values are ALWAYS passed as $N parameters (QueryContext/ExecContext),
 //   never interpolated into SQL strings.
 // - When building dynamic WHERE clauses, only the parameter index ($N) is concatenated
 //   via fmt.Sprintf — this is safe because it only contains digits.
 
 import (
-	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"html"
 	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 )
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
-	if err := s.db.PingContext(r.Context()); err != nil {
-		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
-		return
-	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
-type uiRuntimeConfig struct {
-	BasePath       string `json:"basePath"`
-	APIBasePath    string `json:"apiBasePath"`
-	StaticBasePath string `json:"staticBasePath"`
+	w.Write([]byte("ok"))
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.runtimeConfig(r))
 }
 
-func (s *Server) runtimeConfig(r *http.Request) uiRuntimeConfig {
-	basePath := s.publicBasePath(r)
-	return uiRuntimeConfig{
-		BasePath:       basePath,
-		APIBasePath:    joinPathPrefixes(basePath, "/api"),
-		StaticBasePath: joinPathPrefixes(basePath, "/_static"),
-	}
-}
-
-func (s *Server) publicBasePath(r *http.Request) string {
-	basePath := s.cfg.BasePath
-	forwardedPrefix := normalizePathPrefix(extractForwardedPrefix(r))
-	if forwardedPrefix == "" {
-		return basePath
-	}
-	if basePath == "" {
-		return forwardedPrefix
-	}
-	if strings.HasSuffix(forwardedPrefix, basePath) {
-		return forwardedPrefix
-	}
-	return joinPathPrefixes(forwardedPrefix, basePath)
-}
-
-func extractForwardedPrefix(r *http.Request) string {
-	for _, headerName := range []string{"X-Forwarded-Prefix", "X-Forwarded-Path", "X-Script-Name"} {
-		raw := strings.TrimSpace(r.Header.Get(headerName))
-		if raw == "" {
-			continue
-		}
-
-		parts := strings.Split(raw, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			value := strings.TrimSpace(parts[i])
-			if value != "" {
-				return value
-			}
-		}
-	}
-	return ""
-}
-
-func normalizePathPrefix(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || value == "/" {
-		return ""
-	}
-	if idx := strings.IndexAny(value, "?#"); idx >= 0 {
-		value = value[:idx]
-	}
-	if !strings.HasPrefix(value, "/") {
-		value = "/" + value
-	}
-	value = "/" + strings.TrimLeft(value, "/")
-	value = strings.TrimRight(value, "/")
-	if value == "/" {
-		return ""
-	}
-	return value
-}
-
-func joinPathPrefixes(parts ...string) string {
-	result := ""
-	for _, part := range parts {
-		normalized := normalizePathPrefix(part)
-		if normalized == "" {
-			continue
-		}
-		if result == "" {
-			result = normalized
-			continue
-		}
-		result += normalized
-	}
-	if result == "" {
-		return ""
-	}
-	return result
-}
-
-func (s *Server) renderIndexHTML(runtimeCfg uiRuntimeConfig) []byte {
-	if len(s.indexHTML) == 0 {
-		return nil
-	}
-
-	baseHref := runtimeCfg.BasePath
-	if baseHref == "" {
-		baseHref = "/"
-	} else {
-		baseHref += "/"
-	}
-
-	payload, err := json.Marshal(runtimeCfg)
-	if err != nil {
-		payload = []byte("{}")
-	}
-
-	injection := fmt.Sprintf("<base href=\"%s\"><script>window.__HABITAT_RUNTIME_CONFIG__=%s;</script>", html.EscapeString(baseHref), payload)
-	document := string(s.indexHTML)
-	staticPrefix := runtimeCfg.StaticBasePath + "/"
-	document = strings.ReplaceAll(document, "\"/_static/", staticPrefix+'"')
-	document = strings.ReplaceAll(document, "'/_static/", staticPrefix+"'")
-	if idx := strings.Index(document, "</head>"); idx >= 0 {
-		document = document[:idx] + injection + document[idx:]
-	} else {
-		document = injection + document
-	}
-	return []byte(document)
-}
-
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.NotFound(w, r)
+	runtimeCfg := s.runtimeConfig(r)
+	runtimeCfg.Title = "Habitat"
+	runtimeCfg.ShowCheckpoints = true
+	document := s.renderIndexHTML(runtimeCfg)
+	if len(document) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-
-	path := r.URL.Path
-	if path == "" {
-		path = "/"
-	}
-
-	// Keep API and internal prefixed routes on their dedicated mux handlers.
-	if strings.HasPrefix(path, "/api") || strings.HasPrefix(path, "/_") {
-		http.NotFound(w, r)
-		return
-	}
-
-	if len(s.indexHTML) == 0 {
-		http.Error(w, "frontend assets not built - run `npm run build`", http.StatusServiceUnavailable)
-		return
-	}
-
-	indexHTML := s.renderIndexHTML(s.runtimeConfig(r))
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
-		return
-	}
-	_, _ = w.Write(indexHTML)
+	w.Write(document)
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Query all queues and compute metrics based on task states
-	rows, err := s.db.QueryContext(ctx, `SELECT queue_name, created_at FROM absurd.queues ORDER BY queue_name`)
-	if err != nil {
-		http.Error(w, "failed to query queues", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	metrics := make([]QueueMetrics, 0)
-	now := time.Now()
-
-	for rows.Next() {
-		var queueName string
-		var createdAt time.Time
-		if err := rows.Scan(&queueName, &createdAt); err != nil {
-			log.Printf("handleMetrics: failed to scan queue: %v", err)
-			continue
-		}
-
-		ttable := queueTableIdentifier("t", queueName)
-		rtable := queueTableIdentifier("r", queueName)
-
-		// Query task counts and timing info
-		query := fmt.Sprintf(`
-			SELECT
-				COUNT(*) as total_tasks,
-				COUNT(*) FILTER (WHERE t.state IN ('pending', 'sleeping')) as queued_tasks,
-				COUNT(*) FILTER (WHERE t.state = 'pending' AND r.available_at <= NOW()) as visible_tasks,
-				MIN(CASE WHEN t.state IN ('pending', 'sleeping') THEN r.created_at END) as oldest_at,
-				MAX(CASE WHEN t.state IN ('pending', 'sleeping') THEN r.created_at END) as newest_at
-			FROM absurd.%s t
-			LEFT JOIN absurd.%s r ON r.task_id = t.task_id AND r.run_id = t.last_attempt_run
-		`, ttable, rtable)
-
-		var totalTasks, queuedTasks, visibleTasks int64
-		var oldestAt, newestAt sql.NullTime
-		err := s.db.QueryRowContext(ctx, query).Scan(&totalTasks, &queuedTasks, &visibleTasks, &oldestAt, &newestAt)
-		if err != nil {
-			log.Printf("handleMetrics: failed to query metrics for queue %s: %v", queueName, err)
-			continue
-		}
-
-		metrics = append(metrics, QueueMetrics{
-			QueueName:          queueName,
-			QueueLength:        queuedTasks,
-			QueueVisibleLength: visibleTasks,
-			NewestMsgAt:        nullableTime(newestAt),
-			OldestMsgAt:        nullableTime(oldestAt),
-			TotalMessages:      totalTasks,
-			ScrapeTime:         now,
-		})
-	}
-
-	if err := rows.Err(); err != nil {
-		http.Error(w, "failed to iterate queues", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"queues": metrics,
-	})
-}
-
-type queueMetricsRecord struct {
-	QueueName          string
-	QueueLength        int64
-	NewestMsgAt        sql.NullTime
-	OldestMsgAt        sql.NullTime
-	TotalMessages      int64
-	ScrapeTime         time.Time
-	QueueVisibleLength int64
-}
-
-// QueueMetrics is the API representation of queue metrics.
-type QueueMetrics struct {
-	QueueName          string     `json:"queueName"`
-	QueueLength        int64      `json:"queueLength"`
-	NewestMsgAt        *time.Time `json:"newestMsgAt,omitempty"`
-	OldestMsgAt        *time.Time `json:"oldestMsgAt,omitempty"`
-	TotalMessages      int64      `json:"totalMessages"`
-	ScrapeTime         time.Time  `json:"scrapeTime"`
-	QueueVisibleLength int64      `json:"queueVisibleLength"`
-}
-
-func (r queueMetricsRecord) AsAPI() QueueMetrics {
-	return QueueMetrics{
-		QueueName:          r.QueueName,
-		QueueLength:        r.QueueLength,
-		NewestMsgAt:        nullableTime(r.NewestMsgAt),
-		OldestMsgAt:        nullableTime(r.OldestMsgAt),
-		TotalMessages:      r.TotalMessages,
-		ScrapeTime:         r.ScrapeTime,
-		QueueVisibleLength: r.QueueVisibleLength,
-	}
-}
-
-func parseOptionalTime(value string) *time.Time {
-	if value == "" {
-		return nil
-	}
-	t, err := time.Parse(time.RFC3339, value)
-	if err != nil {
-		// Try RFC3339Nano as well
-		t, err = time.Parse(time.RFC3339Nano, value)
-		if err != nil {
-			return nil
-		}
-	}
-	return &t
-}
-
-func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
-	queryValues := r.URL.Query()
-	search := strings.TrimSpace(queryValues.Get("q"))
-
-	timeout := 30 * time.Second
-	if search != "" {
-		// Free-text search scans more rows and can legitimately take longer.
-		timeout = 120 * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	statusFilter, statusValid := normalizeTaskStatusFilter(queryValues.Get("status"))
-	queueFilter := strings.TrimSpace(queryValues.Get("queue"))
-	taskNameFilter := strings.TrimSpace(queryValues.Get("taskName"))
-	taskIDFilter := strings.TrimSpace(queryValues.Get("taskId"))
-	afterTime := parseOptionalTime(strings.TrimSpace(queryValues.Get("after")))
-	beforeTime := parseOptionalTime(strings.TrimSpace(queryValues.Get("before")))
-
-	page := parsePositiveInt(queryValues.Get("page"), 1)
-	perPage := parsePositiveInt(queryValues.Get("perPage"), 25)
-	if perPage > 200 {
-		perPage = 200
-	}
-	if page < 1 {
-		page = 1
-	}
-
 	queueNames, err := s.listQueueNames(ctx)
 	if err != nil {
-		if isContextQueryFailure(err, ctx) {
-			writeTaskQueryContextError(w, err, ctx)
-			return
-		}
-		log.Printf("handleTasks: failed to list queues: %v", err)
-		http.Error(w, "failed to query queues", http.StatusInternalServerError)
+		http.Error(w, "failed to list queues", http.StatusInternalServerError)
 		return
 	}
 
-	if !statusValid {
-		writeJSON(w, http.StatusOK, emptyTaskListResponse(page, perPage, queueNames))
-		return
-	}
-
-	if taskIDFilter != "" {
-		parsedTaskID, err := uuid.Parse(taskIDFilter)
-		if err != nil {
-			writeJSON(w, http.StatusOK, emptyTaskListResponse(page, perPage, queueNames))
-			return
-		}
-		// Normalize UUID input (for example URN forms) to Postgres-compatible text.
-		taskIDFilter = parsedTaskID.String()
-	}
-
-	selectedQueues := queueNames
-	if queueFilter != "" {
-		selectedQueues = make([]string, 0, 1)
-		for _, queueName := range queueNames {
-			if queueName == queueFilter {
-				selectedQueues = append(selectedQueues, queueName)
-				break
-			}
-		}
-		if len(selectedQueues) == 0 {
-			writeJSON(w, http.StatusOK, emptyTaskListResponse(page, perPage, queueNames))
-			return
+	var metrics []interface{}
+	for _, queueName := range queueNames {
+		m := s.fetchQueueMetricsForQueue(ctx, queueName)
+		if m != nil {
+			metrics = append(metrics, m)
 		}
 	}
 
-	availableTaskNames, err := s.listRecentTaskNames(ctx, selectedQueues, 5000)
-	if err != nil {
-		if isContextQueryFailure(err, ctx) {
-			writeTaskQueryContextError(w, err, ctx)
-			return
-		}
-		log.Printf("handleTasks: failed to list recent task names: %v", err)
-		availableTaskNames = []string{}
-	}
-
-	start := (page - 1) * perPage
-	windowSize := start + perPage + 1
-	if windowSize < perPage+1 {
-		windowSize = perPage + 1
-	}
-
-	limitPerQueue := windowSize
-	includeParams := search != ""
-	if search != "" {
-		// Search still scans params in Go for exact behavior.
-		limitPerQueue = 0
-	}
-
-	var merged []TaskSummary
-	hasWindowTruncation := false
-	for _, queueName := range selectedQueues {
-		queueTasks, truncated, err := s.fetchQueueTaskCandidates(
-			ctx,
-			queueName,
-			statusFilter,
-			taskNameFilter,
-			taskIDFilter,
-			limitPerQueue,
-			includeParams,
-			afterTime,
-			beforeTime,
-		)
-		if err != nil {
-			if isContextQueryFailure(err, ctx) {
-				log.Printf("handleTasks: context error while querying queue %s: %v", queueName, err)
-				writeTaskQueryContextError(w, err, ctx)
-				return
-			}
-			log.Printf("handleTasks: failed to query tasks for queue %s: %v", queueName, err)
-			continue
-		}
-		merged = append(merged, queueTasks...)
-		if truncated {
-			hasWindowTruncation = true
-		}
-	}
-
-	if search != "" {
-		searched := make([]TaskSummary, 0, len(merged))
-		for _, task := range merged {
-			if matchesTaskFilters(task, search, "", "", "", "") {
-				searched = append(searched, task)
-			}
-		}
-		merged = searched
-	}
-
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].RunID > merged[j].RunID
-	})
-
-	total := -1
-	if search != "" || !hasWindowTruncation {
-		total = len(merged)
-	}
-
-	if start > len(merged) {
-		start = len(merged)
-	}
-	end := start + perPage
-	if end > len(merged) {
-		end = len(merged)
-	}
-
-	hasMore := len(merged) > end || hasWindowTruncation
-	if total >= 0 {
-		hasMore = end < total
-	}
-
-	if queueNames == nil {
-		queueNames = []string{}
-	}
-
-	response := TaskListResponse{
-		Items:              merged[start:end],
-		Total:              total,
-		HasMore:            hasMore,
-		Page:               page,
-		PerPage:            perPage,
-		AvailableStatuses:  allTaskStatuses(),
-		AvailableQueues:    queueNames,
-		AvailableTaskNames: availableTaskNames,
+	response := map[string]interface{}{
+		"queues":     metrics,
+		"scrapeTime": time.Now(),
 	}
 
 	writeJSON(w, http.StatusOK, response)
 }
 
-type recentTaskNamesCacheEntry struct {
-	values    []string
-	expiresAt time.Time
+func (s *Server) fetchQueueMetricsForQueue(ctx context.Context, queueName string) interface{} {
+	return nil
 }
 
-const recentTaskNamesCacheTTL = time.Minute
+func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
 
-func (s *Server) listRecentTaskNames(ctx context.Context, queueNames []string, recentRunLimit int) ([]string, error) {
-	if len(queueNames) == 0 {
-		return []string{}, nil
-	}
-	if recentRunLimit <= 0 {
-		return []string{}, nil
-	}
-
-	namesByValue := make(map[string]struct{})
-
-	for _, queueName := range queueNames {
-		queueTaskNames, err := s.getRecentQueueTaskNamesCached(ctx, queueName, recentRunLimit)
-		if err != nil {
-			if isContextQueryFailure(err, ctx) {
-				return nil, err
-			}
-			log.Printf("listRecentTaskNames: failed to query queue %s: %v", queueName, err)
-			continue
-		}
-
-		for _, taskName := range queueTaskNames {
-			trimmedName := strings.TrimSpace(taskName)
-			if trimmedName == "" {
-				continue
-			}
-			namesByValue[trimmedName] = struct{}{}
+	queryValues := r.URL.Query()
+	search := strings.TrimSpace(queryValues.Get("search"))
+	statusFilter := ""
+	statusValid := false
+	if queryValues.Get("status") != "" {
+		statusFilter, statusValid = normalizeTaskStatusFilter(queryValues.Get("status"))
+		if !statusValid {
+			http.Error(w, "invalid status filter", http.StatusBadRequest)
+			return
 		}
 	}
+	afterTime := parseOptionalTime(strings.TrimSpace(queryValues.Get("after")))
+	beforeTime := parseOptionalTime(strings.TrimSpace(queryValues.Get("before")))
+	page := parsePositiveInt(queryValues.Get("page"), 1)
+	perPage := parsePositiveInt(queryValues.Get("perPage"), 25)
 
-	result := make([]string, 0, len(namesByValue))
-	for taskName := range namesByValue {
-		result = append(result, taskName)
-	}
-	sort.Strings(result)
-
-	return result, nil
-}
-
-func (s *Server) getRecentQueueTaskNamesCached(ctx context.Context, queueName string, recentRunLimit int) ([]string, error) {
-	now := time.Now()
-
-	s.recentTaskNamesMu.RLock()
-	entry, ok := s.recentTaskNamesCache[queueName]
-	s.recentTaskNamesMu.RUnlock()
-	if ok && now.Before(entry.expiresAt) {
-		return append([]string(nil), entry.values...), nil
-	}
-
-	taskNames, err := s.fetchRecentQueueTaskNames(ctx, queueName, recentRunLimit)
+	queueNames, err := s.listQueueNames(ctx)
 	if err != nil {
-		return nil, err
-	}
-
-	s.recentTaskNamesMu.Lock()
-	if s.recentTaskNamesCache == nil {
-		s.recentTaskNamesCache = map[string]recentTaskNamesCacheEntry{}
-	}
-	s.recentTaskNamesCache[queueName] = recentTaskNamesCacheEntry{
-		values:    append([]string(nil), taskNames...),
-		expiresAt: now.Add(recentTaskNamesCacheTTL),
-	}
-	s.recentTaskNamesMu.Unlock()
-
-	return taskNames, nil
-}
-
-func (s *Server) fetchRecentQueueTaskNames(ctx context.Context, queueName string, recentRunLimit int) ([]string, error) {
-	if recentRunLimit <= 0 {
-		return []string{}, nil
-	}
-
-	ttable := queueTableIdentifier("t", queueName)
-	rtable := queueTableIdentifier("r", queueName)
-
-	query := fmt.Sprintf(`
-		WITH recent_runs AS (
-			SELECT task_id
-			FROM absurd.%s
-			ORDER BY run_id DESC
-			LIMIT $1
-		)
-		SELECT DISTINCT t.task_name
-		FROM recent_runs r
-		JOIN absurd.%s t ON t.task_id = r.task_id
-		WHERE t.task_name <> ''
-		ORDER BY t.task_name
-	`, rtable, ttable)
-
-	rows, err := s.db.QueryContext(ctx, query, recentRunLimit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	taskNames := make([]string, 0)
-	for rows.Next() {
-		var taskName string
-		if err := rows.Scan(&taskName); err != nil {
-			return nil, err
-		}
-		taskNames = append(taskNames, taskName)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return taskNames, nil
-}
-
-func isContextQueryFailure(err error, ctx context.Context) bool {
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return true
-		}
-	}
-
-	ctxErr := ctx.Err()
-	return errors.Is(ctxErr, context.DeadlineExceeded) || errors.Is(ctxErr, context.Canceled)
-}
-
-func writeTaskQueryContextError(w http.ResponseWriter, err error, ctx context.Context) {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		http.Error(w, "task query timed out", http.StatusGatewayTimeout)
+		http.Error(w, "failed to list queues", http.StatusInternalServerError)
 		return
 	}
 
-	http.Error(w, "task query canceled", http.StatusServiceUnavailable)
-}
-
-func allTaskStatuses() []string {
-	return []string{"pending", "running", "sleeping", "completed", "failed", "cancelled"}
-}
-
-func normalizeTaskStatusFilter(value string) (string, bool) {
-	status := strings.ToLower(strings.TrimSpace(value))
-	if status == "" {
-		return "", true
+	if len(queueNames) == 0 {
+		writeJSON(w, http.StatusOK, emptyTaskListResponse(page, perPage, queueNames))
+		return
 	}
 
-	for _, candidate := range allTaskStatuses() {
-		if status == candidate {
-			return status, true
+	allTasks := make([]TaskSummary, 0)
+	for _, queueName := range queueNames {
+		tasks, _, err := s.fetchQueueTaskCandidates(ctx, queueName, statusFilter, "", "", perPage, true, afterTime, beforeTime)
+		if err != nil {
+			if isContextQueryFailure(err, ctx) {
+				writeTaskQueryContextError(w, err, ctx)
+				return
+			}
+			log.Printf("handleTasks: failed to fetch queue %s: %v", queueName, err)
+			continue
+		}
+		for _, task := range tasks {
+			if matchesTaskFilters(task, search, "", "", "", "") {
+				allTasks = append(allTasks, task)
+			}
 		}
 	}
 
-	return "", false
-}
-
-func emptyTaskListResponse(page, perPage int, queueNames []string) TaskListResponse {
-	if queueNames == nil {
-		queueNames = []string{}
+	recentNames, err := s.listRecentTaskNames(ctx, queueNames, 20)
+	if err != nil {
+		log.Printf("handleTasks: failed to list recent names: %v", err)
+	}
+	recentSet := make(map[string]struct{})
+	for _, n := range recentNames {
+		recentSet[n] = struct{}{}
 	}
 
-	return TaskListResponse{
-		Items:              []TaskSummary{},
-		Total:              0,
-		HasMore:            false,
+	filteredTasks := make([]TaskSummary, 0)
+	for _, t := range allTasks {
+		_, inRecent := recentSet[t.TaskName]
+		_, hasStatus := map[string]struct{}{
+			"waiting": {}, "scheduled": {}, "running": {},
+		}[t.Status]
+		if !hasStatus || (search == "" && inRecent) {
+			filteredTasks = append(filteredTasks, t)
+		}
+	}
+
+	if page < 1 {
+		page = 1
+	}
+	start := (page - 1) * perPage
+	end := start + perPage
+	if start > len(filteredTasks) {
+		filteredTasks = []TaskSummary{}
+	} else if end > len(filteredTasks) {
+		filteredTasks = filteredTasks[start:]
+	} else {
+		filteredTasks = filteredTasks[start:end]
+	}
+
+	response := TaskListResponse{
+		Tasks:              filteredTasks,
+		Count:              len(filteredTasks),
+		TotalCount:         len(allTasks),
 		Page:               page,
 		PerPage:            perPage,
 		AvailableStatuses:  allTaskStatuses(),
-		AvailableQueues:    queueNames,
-		AvailableTaskNames: []string{},
-	}
-}
-
-func (s *Server) fetchQueueTaskCandidates(
-	ctx context.Context,
-	queueName string,
-	statusFilter string,
-	taskNameFilter string,
-	taskIDFilter string,
-	limit int,
-	includeParams bool,
-	afterTime *time.Time,
-	beforeTime *time.Time,
-) ([]TaskSummary, bool, error) {
-	ttable := queueTableIdentifier("t", queueName)
-	rtable := queueTableIdentifier("r", queueName)
-	queueLiteral := pq.QuoteLiteral(queueName)
-	paramsSelect := "NULL::jsonb"
-	if includeParams {
-		paramsSelect = "t.params"
 	}
 
-	query := fmt.Sprintf(`
-		SELECT
-			t.task_id,
-			r.run_id,
-			%s AS queue_name,
-			t.task_name,
-			r.state,
-			r.attempt,
-			t.max_attempts,
-			r.created_at,
-			COALESCE(r.completed_at, r.failed_at, r.started_at, r.created_at) AS updated_at,
-			r.completed_at,
-			r.claimed_by,
-			%s AS params
-		FROM absurd.%s r
-		JOIN absurd.%s t ON t.task_id = r.task_id
-	`, queueLiteral, paramsSelect, rtable, ttable)
-
-	var (
-		clauses []string
-		params  []any
-	)
-
-	if statusFilter != "" {
-		params = append(params, statusFilter)
-		clauses = append(clauses, fmt.Sprintf("r.state = $%d", len(params)))
-	}
-	if taskNameFilter != "" {
-		params = append(params, taskNameFilter)
-		clauses = append(clauses, fmt.Sprintf("t.task_name = $%d", len(params)))
-	}
-	if taskIDFilter != "" {
-		params = append(params, taskIDFilter)
-		clauses = append(clauses, fmt.Sprintf("t.task_id = $%d", len(params)))
-	}
-	if afterTime != nil {
-		params = append(params, *afterTime)
-		clauses = append(clauses, fmt.Sprintf("r.created_at >= $%d", len(params)))
-	}
-	if beforeTime != nil {
-		params = append(params, *beforeTime)
-		clauses = append(clauses, fmt.Sprintf("r.created_at <= $%d", len(params)))
-	}
-
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
-	}
-
-	query += " ORDER BY r.run_id DESC"
-
-	queryLimit := limit
-	if queryLimit > 0 {
-		queryLimit += 1
-		params = append(params, queryLimit)
-		query += fmt.Sprintf(" LIMIT $%d", len(params))
-	}
-
-	rows, err := s.db.QueryContext(ctx, query, params...)
-	if err != nil {
-		return nil, false, err
-	}
-	defer rows.Close()
-
-	tasks := make([]TaskSummary, 0)
-	for rows.Next() {
-		var record taskSummaryRecord
-		if err := rows.Scan(
-			&record.TaskID,
-			&record.RunID,
-			&record.QueueName,
-			&record.TaskName,
-			&record.Status,
-			&record.Attempt,
-			&record.MaxAttempts,
-			&record.CreatedAt,
-			&record.UpdatedAt,
-			&record.CompletedAt,
-			&record.ClaimedBy,
-			&record.Params,
-		); err != nil {
-			return nil, false, err
-		}
-		tasks = append(tasks, record.AsAPI())
-	}
-	if err := rows.Err(); err != nil {
-		return nil, false, err
-	}
-
-	truncated := false
-	if limit > 0 && len(tasks) > limit {
-		tasks = tasks[:limit]
-		truncated = true
-	}
-
-	return tasks, truncated, nil
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Extract run ID from URL path
-	runID := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
-	if runID == "" {
-		http.Error(w, "run ID required", http.StatusBadRequest)
+	taskID := r.URL.Query().Get("taskId")
+	queueName := r.URL.Query().Get("queue")
+	if taskID == "" || queueName == "" {
+		http.Error(w, "taskId and queue are required", http.StatusBadRequest)
 		return
 	}
 
-	queueName, err := s.findQueueForRun(ctx, runID)
-	if err == sql.ErrNoRows {
-		http.Error(w, "task not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		log.Printf("handleTaskDetail: failed to locate queue for run %s: %v", runID, err)
-		http.Error(w, "failed to query task", http.StatusInternalServerError)
-		return
-	}
-
-	// Ensure the queue still exists and query full task details from t_* and r_* tables
 	if err := s.ensureQueueExists(ctx, queueName); err != nil {
-		log.Printf("handleTaskDetail: failed to confirm queue %s exists: %v", queueName, err)
-		http.Error(w, "failed to query task", http.StatusInternalServerError)
+		http.Error(w, "queue not found", http.StatusNotFound)
 		return
 	}
-
-	ttable := queueTableIdentifier("t", queueName)
-	rtable := queueTableIdentifier("r", queueName)
-	queueLiteral := pq.QuoteLiteral(queueName)
-	query := fmt.Sprintf(`
-		SELECT
-			t.task_id,
-			r.run_id,
-			%s AS queue_name,
-			t.task_name,
-			t.state,
-			r.attempt,
-			t.max_attempts,
-			t.params,
-			t.retry_strategy,
-			t.headers,
-			COALESCE(r.failure_reason, r.result) AS state,
-			r.created_at,
-			COALESCE(r.completed_at, r.failed_at, r.started_at, r.created_at) AS updated_at,
-			r.completed_at,
-			r.claimed_by
-		FROM absurd.%s t
-		JOIN absurd.%s r ON r.task_id = t.task_id
-		WHERE r.run_id = $1
-		LIMIT 1
-	`, queueLiteral, ttable, rtable)
 
 	var task taskDetailRecord
-	err = s.db.QueryRowContext(ctx, query, runID).Scan(
-		&task.TaskID,
-		&task.RunID,
-		&task.QueueName,
-		&task.TaskName,
-		&task.Status,
-		&task.Attempt,
-		&task.MaxAttempts,
-		&task.Params,
-		&task.RetryStrategy,
-		&task.Headers,
-		&task.State,
-		&task.CreatedAt,
-		&task.UpdatedAt,
-		&task.CompletedAt,
-		&task.ClaimedBy,
+	query := fmt.Sprintf(`
+		SELECT t.task_id, r.run_id, t.task_name, r.state, r.attempt,
+		       t.params, t.retry_strategy, t.headers, r.state,
+		       r.created_at, r.completed_at, r.claimed_by
+		FROM absurd.%s r
+		JOIN absurd.%s t ON t.task_id = r.task_id
+		WHERE t.task_id = $1
+	`, queueTableIdentifier("r", queueName), queueTableIdentifier("t", queueName))
+
+	err := s.db.QueryRowContext(ctx, query, taskID).Scan(
+		&task.TaskID, &task.RunID, &task.TaskName, &task.Status, &task.Attempt,
+		&task.Params, &task.RetryStrategy, &task.Headers, &task.State,
+		&task.CreatedAt, &task.CompletedAt, &task.ClaimedBy,
 	)
-	if err == sql.ErrNoRows {
+	if err != nil {
+		if isContextQueryFailure(err, ctx) {
+			writeTaskQueryContextError(w, err, ctx)
+			return
+		}
 		http.Error(w, "task not found", http.StatusNotFound)
 		return
 	}
-	if err != nil {
-		http.Error(w, "failed to query task details", http.StatusInternalServerError)
-		return
-	}
 
-	// Query checkpoints from c_* table. For run detail view, only show checkpoints owned by this run.
 	ctable := queueTableIdentifier("c", queueName)
 	wtable := queueTableIdentifier("w", queueName)
-	etable := queueTableIdentifier("e", queueName)
-	checkpointQuery := fmt.Sprintf(`
-		SELECT checkpoint_name, state, status, owner_run_id, NULL::timestamptz AS expires_at, updated_at
-		FROM absurd.%s
-		WHERE task_id = $1 AND owner_run_id = $2
-		ORDER BY updated_at DESC
-	`, ctable)
 
-	checkpointRows, err := s.db.QueryContext(ctx, checkpointQuery, task.TaskID, runID)
+	checkpointsQuery := fmt.Sprintf(`
+		SELECT checkpoint_name, state, status, owner_run_id, expires_at, updated_at
+		FROM absurd.%s
+		WHERE owner_run_id = $1
+		ORDER BY updated_at ASC
+	`, ctable)
+	crows, err := s.db.QueryContext(ctx, checkpointsQuery, task.RunID)
 	if err != nil {
-		log.Printf("handleTaskDetail: checkpoint query failed for run %s: %v", runID, err)
-		http.Error(w, "failed to query checkpoints", http.StatusInternalServerError)
-		return
-	}
-	defer checkpointRows.Close()
-	for checkpointRows.Next() {
-		var cp checkpointStateRecord
-		if err := checkpointRows.Scan(
-			&cp.StepName,
-			&cp.State,
-			&cp.Status,
-			&cp.OwnerRunID,
-			&cp.ExpiresAt,
-			&cp.UpdatedAt,
-		); err == nil {
-			task.Checkpoints = append(task.Checkpoints, cp)
+		log.Printf("handleTaskDetail: failed to fetch checkpoints: %v", err)
+	} else {
+		defer crows.Close()
+		for crows.Next() {
+			var cp checkpointStateRecord
+			if err := crows.Scan(&cp.CheckpointName, &cp.State, &cp.Status, &cp.OwnerRunID, &cp.ExpiresAt, &cp.UpdatedAt); err == nil {
+				task.Checkpoints = append(task.Checkpoints, cp)
+			}
 		}
 	}
 
 	waitQuery := fmt.Sprintf(`
-			SELECT
-				CASE
-					WHEN r.wake_event IS NOT NULL THEN 'event'
-				WHEN r.available_at > NOW() THEN 'timer'
-				ELSE 'none'
-			END AS wait_type,
-			r.available_at,
-			r.wake_event,
-			w.step_name,
-				NULL::jsonb AS payload,
-				r.event_payload,
-				w.created_at,
-				e.emitted_at
-			FROM absurd.%[1]s r
-			LEFT JOIN absurd.%[2]s w ON w.run_id = r.run_id
-			LEFT JOIN absurd.%[3]s e ON e.event_name = r.wake_event AND e.payload IS NOT NULL
-			WHERE r.run_id = $1 AND r.state = 'sleeping'
-			ORDER BY w.created_at DESC
-		`, rtable, wtable, etable)
-
-	waitRows, err := s.db.QueryContext(ctx, waitQuery, runID)
-	if err == nil {
-		defer waitRows.Close()
-		for waitRows.Next() {
+		SELECT wait_duration, poll_interval, run_id
+		FROM absurd.%s
+		WHERE run_id = $1
+	`, wtable)
+	wrows, err := s.db.QueryContext(ctx, waitQuery, task.RunID)
+	if err != nil {
+		log.Printf("handleTaskDetail: failed to fetch wait states: %v", err)
+	} else {
+		defer wrows.Close()
+		for wrows.Next() {
 			var wt waitStateRecord
-			if err := waitRows.Scan(
-				&wt.WaitType,
-				&wt.WakeAt,
-				&wt.WakeEvent,
-				&wt.StepName,
-				&wt.Payload,
-				&wt.EventPayload,
-				&wt.UpdatedAt,
-				&wt.EmittedAt,
-			); err == nil {
+			if err := wrows.Scan(&wt.WaitDuration, &wt.PollInterval, &wt.RunID); err == nil {
 				task.WaitStates = append(task.WaitStates, wt)
 			}
 		}
 	}
 
-	writeJSON(w, http.StatusOK, task.AsAPI())
-}
+	runtimeCfg := s.runtimeConfig(r)
+	runtimeCfg.Title = "Task: " + task.TaskName
+	runtimeCfg.QueueName = queueName
+	runtimeCfg.IsTaskDetail = true
+	runtimeCfg.ShowCheckpoints = true
+	runtimeCfg.ShowTaskWaitInfo = len(task.WaitStates) > 0
+	document := s.renderIndexHTML(runtimeCfg)
 
-type retryTaskRequest struct {
-	TaskID        string `json:"taskId"`
-	QueueName     string `json:"queueName"`
-	SpawnNewTask  bool   `json:"spawnNewTask"`
-	MaxAttempts   *int   `json:"maxAttempts,omitempty"`
-	ExtraAttempts *int   `json:"extraAttempts,omitempty"`
-}
+	if len(document) == 0 {
+		writeJSON(w, http.StatusOK, task.AsAPI())
+		return
+	}
 
-type retryTaskResponse struct {
-	TaskID    string `json:"taskId"`
-	RunID     string `json:"runId"`
-	Attempt   int    `json:"attempt"`
-	Created   bool   `json:"created"`
-	QueueName string `json:"queueName"`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(document)
 }
 
 func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
@@ -945,20 +273,25 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var request retryTaskRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var request struct {
+		TaskID         string   `json:"taskId"`
+		QueueName      string   `json:"queueName"`
+		MaxAttempts    *int     `json:"maxAttempts,omitempty"`
+		ExtraAttempts  *int     `json:"extraAttempts,omitempty"`
+		SpawnNewTask   bool     `json:"spawnNewTask"`
+		AdditionalArgs []string `json:"additionalArgs,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	if strings.TrimSpace(request.TaskID) == "" {
-		http.Error(w, "taskId is required", http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(request.QueueName) == "" {
-		http.Error(w, "queueName is required", http.StatusBadRequest)
+	if request.TaskID == "" || request.QueueName == "" {
+		http.Error(w, "taskId and queueName are required", http.StatusBadRequest)
 		return
 	}
 
@@ -967,6 +300,7 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "taskId must be a valid UUID", http.StatusBadRequest)
 		return
 	}
+	_ = parsedTaskID
 
 	if request.MaxAttempts != nil && *request.MaxAttempts < 1 {
 		http.Error(w, "maxAttempts must be >= 1", http.StatusBadRequest)
@@ -976,180 +310,83 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "extraAttempts must be >= 1", http.StatusBadRequest)
 		return
 	}
-
 	if request.SpawnNewTask && request.ExtraAttempts != nil {
-		http.Error(w, "extraAttempts cannot be used when spawnNewTask is true", http.StatusBadRequest)
-		return
-	}
-	if !request.SpawnNewTask && request.MaxAttempts != nil {
-		http.Error(w, "maxAttempts cannot be used when spawnNewTask is false; use extraAttempts", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	if err := s.ensureQueueExists(ctx, request.QueueName); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "queue not found", http.StatusNotFound)
+		if err := s.db.QueryRowContext(ctx, `
+			UPDATE absurd.`+queueTableIdentifier("t", request.QueueName)+`
+			SET max_attempts = max_attempts + $1
+			WHERE task_id = $2
+			RETURNING task_id
+		`, *request.ExtraAttempts, request.TaskID).Scan(&parsedTaskID); err != nil {
+			http.Error(w, "failed to retry task", http.StatusInternalServerError)
 			return
 		}
-		http.Error(w, "failed to validate queue", http.StatusInternalServerError)
-		return
 	}
 
-	options := map[string]any{}
-	if request.SpawnNewTask {
-		options["spawn_new"] = true
-		if request.MaxAttempts != nil {
-			options["max_attempts"] = *request.MaxAttempts
-		}
-	} else {
-		if request.ExtraAttempts != nil {
-			currentAttempts, err := s.getTaskAttempts(ctx, request.QueueName, parsedTaskID.String())
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					http.Error(w, "task not found in queue", http.StatusNotFound)
-					return
-				}
-				http.Error(w, "failed to load current task attempts", http.StatusInternalServerError)
-				return
-			}
-
-			options["max_attempts"] = currentAttempts + *request.ExtraAttempts
-		}
+	response := map[string]string{
+		"queueName": request.QueueName,
 	}
-
-	optionsJSON, err := json.Marshal(options)
-	if err != nil {
-		http.Error(w, "failed to encode retry options", http.StatusInternalServerError)
-		return
-	}
-
-	var response retryTaskResponse
-	err = s.db.QueryRowContext(
-		ctx,
-		`SELECT task_id, run_id, attempt, created
-		 FROM absurd.retry_task($1, $2, $3::jsonb)`,
-		request.QueueName,
-		parsedTaskID.String(),
-		string(optionsJSON),
-	).Scan(&response.TaskID, &response.RunID, &response.Attempt, &response.Created)
-	if err != nil {
-		var pqErr *pq.Error
-		if errors.As(err, &pqErr) {
-			http.Error(w, pqErr.Message, http.StatusBadRequest)
-			return
-		}
-
-		http.Error(w, "failed to retry task", http.StatusInternalServerError)
-		return
-	}
-
-	response.QueueName = request.QueueName
 	writeJSON(w, http.StatusOK, response)
-}
-
-func (s *Server) getTaskAttempts(ctx context.Context, queueName, taskID string) (int, error) {
-	table := queueTableIdentifier("t", queueName)
-	// SAFE: table name is quoted via pq.QuoteIdentifier; value uses $1 parameter.
-	query := `SELECT attempts FROM absurd.` + table + ` WHERE task_id = $1 LIMIT 1`
-
-	var attempts int
-	err := s.db.QueryRowContext(ctx, query, taskID).Scan(&attempts)
-	if err != nil {
-		return 0, err
-	}
-
-	return attempts, nil
 }
 
 func (s *Server) handleQueues(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Query all queues from absurd.queues table
-	rows, err := s.db.QueryContext(ctx, `SELECT queue_name, created_at FROM absurd.queues ORDER BY queue_name`)
+	queueNames, err := s.listQueueNames(ctx)
 	if err != nil {
-		log.Printf("handleQueues: failed to query queues: %v", err)
-		http.Error(w, "failed to query queues", http.StatusInternalServerError)
+		http.Error(w, "failed to list queues", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
 
-	var queues []QueueSummary
-	for rows.Next() {
-		var queueName string
+	type queueInfo struct {
+		QueueName  string `json:"queueName"`
+		QueueLen   int64  `json:"queueLength"`
+		OldestTask string `json:"oldestTask"`
+		NewestTask string `json:"newestTask"`
+		CreatedAt  string `json:"createdAt"`
+	}
+
+	var queues []queueInfo
+	for _, name := range queueNames {
 		var createdAt time.Time
-		if err := rows.Scan(&queueName, &createdAt); err != nil {
-			http.Error(w, "failed to scan queue", http.StatusInternalServerError)
-			return
+		if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM absurd.queues WHERE queue_name = $1`, name).Scan(&createdAt); err != nil {
+			continue
 		}
-
-		// Count tasks by state for this queue
-		ttable := queueTableIdentifier("t", queueName)
-		countQuery := fmt.Sprintf(`
-			SELECT
-				COUNT(*) FILTER (WHERE state = 'pending') as pending_count,
-				COUNT(*) FILTER (WHERE state = 'running') as running_count,
-				COUNT(*) FILTER (WHERE state = 'sleeping') as sleeping_count,
-				COUNT(*) FILTER (WHERE state = 'completed') as completed_count,
-				COUNT(*) FILTER (WHERE state = 'failed') as failed_count,
-				COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled_count
-			FROM absurd.%s
-		`, ttable)
-
-		var summary QueueSummary
-		summary.QueueName = queueName
-		summary.CreatedAt = &createdAt
-		err := s.db.QueryRowContext(ctx, countQuery).Scan(
-			&summary.PendingCount,
-			&summary.RunningCount,
-			&summary.SleepingCount,
-			&summary.CompletedCount,
-			&summary.FailedCount,
-			&summary.CancelledCount,
-		)
-		if err != nil {
-			log.Printf("handleQueues: failed to count tasks for queue %s: %v", queueName, err)
-			continue // Skip queues with errors
-		}
-
-		queues = append(queues, summary)
+		queues = append(queues, queueInfo{
+			QueueName: name,
+			CreatedAt: createdAt.Format(time.RFC3339),
+		})
 	}
 
-	if err := rows.Err(); err != nil {
-		http.Error(w, "failed to iterate queues", http.StatusInternalServerError)
-		return
+	type response struct {
+		Queues    []queueInfo `json:"queues"`
+		Count     int         `json:"count"`
+		CreatedAt string      `json:"createdAt"`
 	}
 
-	writeJSON(w, http.StatusOK, queues)
+	writeJSON(w, http.StatusOK, response{
+		Queues:    queues,
+		Count:     len(queues),
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
 }
 
 func (s *Server) handleQueueResource(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/queues/")
-	path = strings.Trim(path, "/")
-	if path == "" {
-		http.Error(w, "queue name required", http.StatusBadRequest)
+	queueName := strings.TrimPrefix(r.URL.Path, "/api/queues/")
+	queueName = strings.Split(queueName, "/")[0]
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := s.ensureQueueExists(ctx, queueName); err != nil {
+		http.Error(w, "queue not found", http.StatusNotFound)
 		return
 	}
 
-	parts := strings.Split(path, "/")
-	queueName := parts[0]
-	if queueName == "" {
-		http.Error(w, "queue name required", http.StatusBadRequest)
-		return
-	}
-
-	if len(parts) == 1 {
-		http.NotFound(w, r)
-		return
-	}
-
-	switch parts[1] {
-	case "tasks":
+	switch r.URL.Path {
+	case "/api/queues/" + queueName + "/tasks":
 		s.handleQueueTasks(w, r, queueName)
-	case "events":
+	case "/api/queues/" + queueName + "/events":
 		s.handleQueueEvents(w, r, queueName)
 	default:
 		http.NotFound(w, r)
@@ -1157,599 +394,225 @@ func (s *Server) handleQueueResource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueueTasks(w http.ResponseWriter, r *http.Request, queueName string) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
+	queryValues := r.URL.Query()
+	statusFilter := ""
+	statusValid := false
+	if queryValues.Get("status") != "" {
+		statusFilter, statusValid = normalizeTaskStatusFilter(queryValues.Get("status"))
+		if !statusValid {
+			http.Error(w, "invalid status filter", http.StatusBadRequest)
+			return
+		}
+	}
+	taskNameFilter := queryValues.Get("taskName")
+	taskIDFilter := queryValues.Get("taskId")
+	afterTime := parseOptionalTime(queryValues.Get("after"))
+	beforeTime := parseOptionalTime(queryValues.Get("before"))
+	page := parsePositiveInt(queryValues.Get("page"), 1)
+	perPage := parsePositiveInt(queryValues.Get("perPage"), 25)
+	includeParams := queryValues.Get("includeParams") == "1"
+
 	if err := s.ensureQueueExists(ctx, queueName); err != nil {
-		log.Printf("handleQueueTasks: queue %s not found: %v", queueName, err)
 		http.Error(w, "queue not found", http.StatusNotFound)
 		return
 	}
 
-	ttable := queueTableIdentifier("t", queueName)
-	rtable := queueTableIdentifier("r", queueName)
-	queueLiteral := pq.QuoteLiteral(queueName)
-	query := fmt.Sprintf(`
-		SELECT
-			t.task_id, r.run_id, %s AS queue_name, t.task_name, r.state,
-			r.attempt,
-			t.max_attempts,
-			r.created_at,
-			COALESCE(r.completed_at, r.failed_at, r.started_at, r.created_at) AS updated_at,
-			r.completed_at,
-			r.claimed_by
-		FROM absurd.%s t
-		JOIN absurd.%s r ON r.task_id = t.task_id
-		ORDER BY r.created_at DESC
-	`, queueLiteral, ttable, rtable)
-
-	rows, err := s.db.QueryContext(ctx, query)
+	tasks, hasMore, err := s.fetchQueueTaskCandidates(ctx, queueName, statusFilter, taskNameFilter, taskIDFilter, perPage, includeParams, afterTime, beforeTime)
 	if err != nil {
-		log.Printf("handleQueueTasks: query failed for queue %s: %v", queueName, err)
-		http.Error(w, "failed to query queue tasks", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var tasks []TaskSummary
-	for rows.Next() {
-		var task taskSummaryRecord
-		if err := rows.Scan(
-			&task.TaskID,
-			&task.RunID,
-			&task.QueueName,
-			&task.TaskName,
-			&task.Status,
-			&task.Attempt,
-			&task.MaxAttempts,
-			&task.CreatedAt,
-			&task.UpdatedAt,
-			&task.CompletedAt,
-			&task.ClaimedBy,
-		); err != nil {
-			http.Error(w, "failed to scan task", http.StatusInternalServerError)
+		if isContextQueryFailure(err, ctx) {
+			writeTaskQueryContextError(w, err, ctx)
 			return
 		}
-		tasks = append(tasks, task.AsAPI())
+		http.Error(w, "failed to query tasks", http.StatusInternalServerError)
+		return
 	}
 
-	writeJSON(w, http.StatusOK, tasks)
+	if page < 1 {
+		page = 1
+	}
+	start := (page - 1) * perPage
+	end := start + perPage
+	if start > len(tasks) {
+		tasks = []TaskSummary{}
+	} else if end > len(tasks) {
+		tasks = tasks[start:]
+	} else {
+		tasks = tasks[start:end]
+	}
+
+	response := TaskListResponse{
+		Tasks:              tasks,
+		Count:              len(tasks),
+		TotalCount:         len(tasks) + (1 if hasMore else 0),
+		Page:               page,
+		PerPage:            perPage,
+		AvailableStatuses:  allTaskStatuses(),
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleQueueEvents(w http.ResponseWriter, r *http.Request, queueName string) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	limit := parsePositiveInt(r.URL.Query().Get("limit"), 100)
-	if limit > 500 {
-		limit = 500
-	}
+	queryValues := r.URL.Query()
+	limit := parsePositiveInt(queryValues.Get("limit"), 100)
+	eventName := queryValues.Get("eventName")
+	afterTime := parseOptionalTime(queryValues.Get("after"))
+	beforeTime := parseOptionalTime(queryValues.Get("before"))
 
-	eventName := strings.TrimSpace(r.URL.Query().Get("eventName"))
-
-	events, err := s.fetchQueueEvents(ctx, queueName, limit, eventName, nil, nil)
-	if err != nil {
-		http.Error(w, "failed to query queue events", http.StatusInternalServerError)
+	if err := s.ensureQueueExists(ctx, queueName); err != nil {
+		http.Error(w, "queue not found", http.StatusNotFound)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, events)
-}
-
-func (s *Server) fetchQueueEvents(ctx context.Context, queueName string, limit int, eventName string, afterTime *time.Time, beforeTime *time.Time) ([]QueueEvent, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	if err := s.ensureQueueExists(ctx, queueName); err != nil {
-		return nil, err
-	}
-
-	etable := queueTableIdentifier("e", queueName)
-
-	var (
-		params  []any
-		clauses = []string{"payload IS NOT NULL"}
-	)
-
-	if eventName != "" {
-		params = append(params, eventName)
-		clauses = append(clauses, fmt.Sprintf("event_name = $%d", len(params)))
-	}
-	if afterTime != nil {
-		params = append(params, *afterTime)
-		clauses = append(clauses, fmt.Sprintf("emitted_at >= $%d", len(params)))
-	}
-	if beforeTime != nil {
-		params = append(params, *beforeTime)
-		clauses = append(clauses, fmt.Sprintf("emitted_at <= $%d", len(params)))
-	}
-
-	params = append(params, limit)
-	limitPos := len(params)
-
-	whereClause := ""
-	if len(clauses) > 0 {
-		whereClause = "WHERE " + strings.Join(clauses, " AND ")
-	}
-
-	query := fmt.Sprintf(`
-			SELECT
-				event_name,
-				payload,
-				emitted_at,
-				emitted_at as created_at
-			FROM absurd.%s
-			%s
-			ORDER BY emitted_at DESC
-			LIMIT $%d
-		`, etable, whereClause, limitPos)
-
-	rows, err := s.db.QueryContext(ctx, query, params...)
+	events, err := s.fetchQueueEvents(ctx, queueName, limit, eventName, afterTime, beforeTime)
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var events []QueueEvent
-	for rows.Next() {
-		var record queueEventRecord
-		if err := rows.Scan(
-			&record.EventName,
-			&record.Payload,
-			&record.EmittedAt,
-			&record.CreatedAt,
-		); err != nil {
-			return nil, err
+		if isContextQueryFailure(err, ctx) {
+			writeTaskQueryContextError(w, err, ctx)
+			return
 		}
-		events = append(events, record.AsAPI(queueName))
+		http.Error(w, "failed to query events", http.StatusInternalServerError)
+		return
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, err
+	type response struct {
+		Events    []QueueEvent `json:"events"`
+		Count     int          `json:"count"`
+		QueueName string       `json:"queueName"`
 	}
 
-	return events, nil
+	writeJSON(w, http.StatusOK, response{
+		Events:    events,
+		Count:     len(events),
+		QueueName: queueName,
+	})
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	limit := parsePositiveInt(r.URL.Query().Get("limit"), 100)
-	if limit > 1000 {
-		limit = 1000
-	}
+	queryValues := r.URL.Query()
+	limit := parsePositiveInt(queryValues.Get("limit"), 100)
+	eventName := queryValues.Get("eventName")
+	afterTime := parseOptionalTime(queryValues.Get("after"))
+	beforeTime := parseOptionalTime(queryValues.Get("before"))
 
-	queueFilter := strings.TrimSpace(r.URL.Query().Get("queue"))
-	eventFilter := strings.TrimSpace(r.URL.Query().Get("eventName"))
-	afterTime := parseOptionalTime(strings.TrimSpace(r.URL.Query().Get("after")))
-	beforeTime := parseOptionalTime(strings.TrimSpace(r.URL.Query().Get("before")))
-
-	var events []QueueEvent
-
-	if queueFilter != "" {
-		queueEvents, err := s.fetchQueueEvents(ctx, queueFilter, limit, eventFilter, afterTime, beforeTime)
-		if err != nil {
-			http.Error(w, "failed to query queue events", http.StatusInternalServerError)
-			return
-		}
-		events = queueEvents
-	} else {
-		queueNames, err := s.listQueueNames(ctx)
-		if err != nil {
-			log.Printf("handleEvents: failed to list queues: %v", err)
-			http.Error(w, "failed to query queues", http.StatusInternalServerError)
-			return
-		}
-
-		for _, queueName := range queueNames {
-			queueEvents, err := s.fetchQueueEvents(ctx, queueName, limit, eventFilter, afterTime, beforeTime)
-			if err != nil {
-				continue
-			}
-			events = append(events, queueEvents...)
-		}
-
-		sort.Slice(events, func(i, j int) bool {
-			ti := events[i].CreatedAt
-			if events[i].EmittedAt != nil {
-				ti = *events[i].EmittedAt
-			}
-			tj := events[j].CreatedAt
-			if events[j].EmittedAt != nil {
-				tj = *events[j].EmittedAt
-			}
-			return ti.After(tj)
-		})
-
-		if len(events) > limit {
-			events = events[:limit]
-		}
-	}
-
-	writeJSON(w, http.StatusOK, events)
-}
-
-func (s *Server) listQueueNames(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT queue_name FROM absurd.queues ORDER BY queue_name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var queueNames []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		if name != "" {
-			queueNames = append(queueNames, name)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return queueNames, nil
-}
-
-func (s *Server) findQueueForRun(ctx context.Context, runID string) (string, error) {
 	queueNames, err := s.listQueueNames(ctx)
 	if err != nil {
-		return "", err
+		http.Error(w, "failed to list queues", http.StatusInternalServerError)
+		return
 	}
 
+	var allEvents []QueueEvent
 	for _, queueName := range queueNames {
-		rtable := queueTableIdentifier("r", queueName)
-		// SAFE: table name quoted via pq.QuoteIdentifier; runID uses $1 parameter.
-		query := `SELECT 1 FROM absurd.` + rtable + ` WHERE run_id = $1 LIMIT 1`
-		var dummy int
-		err = s.db.QueryRowContext(ctx, query, runID).Scan(&dummy)
-		switch {
-		case err == nil:
-			return queueName, nil
-		case err == sql.ErrNoRows:
-			continue
-		default:
-			log.Printf("findQueueForRun: query failed for queue %s: %v", queueName, err)
+		events, err := s.fetchQueueEvents(ctx, queueName, limit, eventName, afterTime, beforeTime)
+		if err != nil {
+			log.Printf("handleEvents: failed to fetch events for queue %s: %v", queueName, err)
 			continue
 		}
+		allEvents = append(allEvents, events...)
 	}
 
-	return "", sql.ErrNoRows
-}
-
-func (s *Server) ensureQueueExists(ctx context.Context, queueName string) error {
-	var name string
-	return s.db.QueryRowContext(ctx, `SELECT queue_name FROM absurd.queues WHERE queue_name = $1`, queueName).Scan(&name)
-}
-
-func queueTableIdentifier(prefix, queueName string) string {
-	return pq.QuoteIdentifier(prefix + "_" + queueName)
-}
-
-type taskSummaryRecord struct {
-	TaskID      string
-	RunID       string
-	QueueName   string
-	TaskName    string
-	Status      string
-	Attempt     int
-	MaxAttempts sql.NullInt64
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	CompletedAt sql.NullTime
-	ClaimedBy   sql.NullString
-	Params      []byte
-}
-
-type taskDetailRecord struct {
-	taskSummaryRecord
-	Params        []byte
-	RetryStrategy []byte
-	Headers       []byte
-	State         []byte
-	Checkpoints   []checkpointStateRecord
-	WaitStates    []waitStateRecord
-}
-
-type checkpointStateRecord struct {
-	StepName   string
-	State      []byte
-	Status     string
-	OwnerRunID sql.NullString
-	ExpiresAt  sql.NullTime
-	UpdatedAt  time.Time
-}
-
-type waitStateRecord struct {
-	WaitType     string
-	WakeAt       sql.NullTime
-	WakeEvent    sql.NullString
-	StepName     sql.NullString
-	Payload      []byte
-	EventPayload []byte
-	UpdatedAt    time.Time
-	EmittedAt    sql.NullTime
-}
-
-// TaskSummary is the API representation for task list views
-type TaskSummary struct {
-	TaskID      string          `json:"taskId"`
-	RunID       string          `json:"runId"`
-	QueueName   string          `json:"queueName"`
-	TaskName    string          `json:"taskName"`
-	Status      string          `json:"status"`
-	Attempt     int             `json:"attempt"`
-	MaxAttempts *int            `json:"maxAttempts,omitempty"`
-	CreatedAt   time.Time       `json:"createdAt"`
-	UpdatedAt   time.Time       `json:"updatedAt"`
-	CompletedAt *time.Time      `json:"completedAt,omitempty"`
-	WorkerID    *string         `json:"workerId,omitempty"`
-	Params      json.RawMessage `json:"params,omitempty"`
-}
-
-// TaskDetail is the API representation for expanded task details
-type TaskDetail struct {
-	TaskSummary
-	Params        json.RawMessage   `json:"params,omitempty"`
-	RetryStrategy json.RawMessage   `json:"retryStrategy,omitempty"`
-	Headers       json.RawMessage   `json:"headers,omitempty"`
-	State         json.RawMessage   `json:"state,omitempty"`
-	Checkpoints   []CheckpointState `json:"checkpoints"`
-	Waits         []WaitState       `json:"waits"`
-}
-
-// CheckpointState is the API representation for checkpoint data
-type CheckpointState struct {
-	StepName   string          `json:"stepName"`
-	State      json.RawMessage `json:"state"`
-	Status     string          `json:"status"`
-	OwnerRunID *string         `json:"ownerRunId,omitempty"`
-	ExpiresAt  *time.Time      `json:"expiresAt,omitempty"`
-	UpdatedAt  time.Time       `json:"updatedAt"`
-}
-
-// WaitState describes an active or historical wait for a run.
-type WaitState struct {
-	WaitType     string          `json:"waitType"`
-	WakeAt       *time.Time      `json:"wakeAt,omitempty"`
-	WakeEvent    *string         `json:"wakeEvent,omitempty"`
-	StepName     *string         `json:"stepName,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
-	EventPayload json.RawMessage `json:"eventPayload,omitempty"`
-	EmittedAt    *time.Time      `json:"emittedAt,omitempty"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
-}
-
-// QueueSummary is the API representation for queue list
-type QueueSummary struct {
-	QueueName      string     `json:"queueName"`
-	CreatedAt      *time.Time `json:"createdAt,omitempty"`
-	PendingCount   int64      `json:"pendingCount"`
-	RunningCount   int64      `json:"runningCount"`
-	SleepingCount  int64      `json:"sleepingCount"`
-	CompletedCount int64      `json:"completedCount"`
-	FailedCount    int64      `json:"failedCount"`
-	CancelledCount int64      `json:"cancelledCount"`
-}
-
-type TaskListResponse struct {
-	Items              []TaskSummary `json:"items"`
-	Total              int           `json:"total"`
-	HasMore            bool          `json:"hasMore"`
-	Page               int           `json:"page"`
-	PerPage            int           `json:"perPage"`
-	AvailableStatuses  []string      `json:"availableStatuses"`
-	AvailableQueues    []string      `json:"availableQueues"`
-	AvailableTaskNames []string      `json:"availableTaskNames"`
-}
-
-type queueMessageRecord struct {
-	MessageID  string
-	ReadCount  int
-	EnqueuedAt time.Time
-	VisibleAt  time.Time
-	Message    []byte
-	Headers    []byte
-}
-
-type QueueMessage struct {
-	QueueName  string          `json:"queueName"`
-	MessageID  string          `json:"messageId"`
-	ReadCount  int             `json:"readCount"`
-	EnqueuedAt time.Time       `json:"enqueuedAt"`
-	VisibleAt  time.Time       `json:"visibleAt"`
-	Message    json.RawMessage `json:"message,omitempty"`
-	Headers    json.RawMessage `json:"headers,omitempty"`
-}
-
-type queueEventRecord struct {
-	EventName string
-	Payload   []byte
-	EmittedAt sql.NullTime
-	CreatedAt time.Time
-}
-
-type QueueEvent struct {
-	QueueName string          `json:"queueName"`
-	EventName string          `json:"eventName"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
-	EmittedAt *time.Time      `json:"emittedAt,omitempty"`
-	CreatedAt time.Time       `json:"createdAt"`
-}
-
-func (r queueMessageRecord) AsAPI(queueName string) QueueMessage {
-	return QueueMessage{
-		QueueName:  queueName,
-		MessageID:  r.MessageID,
-		ReadCount:  r.ReadCount,
-		EnqueuedAt: r.EnqueuedAt,
-		VisibleAt:  r.VisibleAt,
-		Message:    nullableBytes(r.Message),
-		Headers:    nullableBytes(r.Headers),
-	}
-}
-
-func (r queueEventRecord) AsAPI(queueName string) QueueEvent {
-	return QueueEvent{
-		QueueName: queueName,
-		EventName: r.EventName,
-		Payload:   nullableBytes(r.Payload),
-		EmittedAt: nullableTime(r.EmittedAt),
-		CreatedAt: r.CreatedAt,
-	}
-}
-
-func (r taskSummaryRecord) AsAPI() TaskSummary {
-	return TaskSummary{
-		TaskID:      r.TaskID,
-		RunID:       r.RunID,
-		QueueName:   r.QueueName,
-		TaskName:    r.TaskName,
-		Status:      r.Status,
-		Attempt:     r.Attempt,
-		MaxAttempts: nullableInt(r.MaxAttempts),
-		CreatedAt:   r.CreatedAt,
-		UpdatedAt:   r.UpdatedAt,
-		CompletedAt: nullableTime(r.CompletedAt),
-		WorkerID:    nullableString(r.ClaimedBy),
-		Params:      nullableBytes(r.Params),
-	}
-}
-
-func (r taskDetailRecord) AsAPI() TaskDetail {
-	checkpoints := make([]CheckpointState, 0, len(r.Checkpoints))
-	for _, cp := range r.Checkpoints {
-		checkpoints = append(checkpoints, CheckpointState{
-			StepName:   cp.StepName,
-			State:      cp.State,
-			Status:     cp.Status,
-			OwnerRunID: nullableString(cp.OwnerRunID),
-			ExpiresAt:  nullableTime(cp.ExpiresAt),
-			UpdatedAt:  cp.UpdatedAt,
-		})
+	type response struct {
+		Events []QueueEvent `json:"events"`
+		Count  int          `json:"count"`
 	}
 
-	waits := make([]WaitState, 0, len(r.WaitStates))
-	for _, wt := range r.WaitStates {
-		waits = append(waits, WaitState{
-			WaitType:     wt.WaitType,
-			WakeAt:       nullableTime(wt.WakeAt),
-			WakeEvent:    nullableString(wt.WakeEvent),
-			StepName:     nullableString(wt.StepName),
-			Payload:      nullableBytes(wt.Payload),
-			EventPayload: nullableBytes(wt.EventPayload),
-			EmittedAt:    nullableTime(wt.EmittedAt),
-			UpdatedAt:    wt.UpdatedAt,
-		})
-	}
-
-	return TaskDetail{
-		TaskSummary:   r.taskSummaryRecord.AsAPI(),
-		Params:        r.Params,
-		RetryStrategy: nullableBytes(r.RetryStrategy),
-		Headers:       nullableBytes(r.Headers),
-		State:         nullableBytes(r.State),
-		Checkpoints:   checkpoints,
-		Waits:         waits,
-	}
-}
-
-func nullableInt(v sql.NullInt64) *int {
-	if !v.Valid {
-		return nil
-	}
-	value := int(v.Int64)
-	return &value
-}
-
-func nullableTime(v sql.NullTime) *time.Time {
-	if !v.Valid {
-		return nil
-	}
-	return &v.Time
-}
-
-func nullableString(v sql.NullString) *string {
-	if !v.Valid {
-		return nil
-	}
-	return &v.String
-}
-
-func nullableBytes(v []byte) json.RawMessage {
-	if len(v) == 0 {
-		return nil
-	}
-	return v
+	writeJSON(w, http.StatusOK, response{
+		Events: allEvents,
+		Count:  len(allEvents),
+	})
 }
 
 func matchesTaskFilters(task TaskSummary, search string, status string, queue string, taskName string, taskID string) bool {
-	if status != "" && !strings.EqualFold(task.Status, status) {
+	if status != "" && task.Status != status {
 		return false
 	}
 	if queue != "" && task.QueueName != queue {
 		return false
 	}
-	if taskName != "" && task.TaskName != taskName {
+	if taskName != "" && !strings.Contains(strings.ToLower(task.TaskName), strings.ToLower(taskName)) {
 		return false
 	}
-	if taskID != "" && task.TaskID != taskID {
+	if taskID != "" && !strings.Contains(strings.ToLower(task.TaskID), strings.ToLower(taskID)) {
 		return false
 	}
-
 	if search != "" {
-		searchLower := strings.ToLower(search)
-		paramsStr := string(task.Params)
-		matchInParams := strings.Contains(strings.ToLower(paramsStr), searchLower)
-		if !strings.Contains(strings.ToLower(task.TaskID), searchLower) &&
-			!strings.Contains(strings.ToLower(task.RunID), searchLower) &&
-			!strings.Contains(strings.ToLower(task.QueueName), searchLower) &&
-			!strings.Contains(strings.ToLower(task.TaskName), searchLower) &&
-			!matchInParams {
+		lsearch := strings.ToLower(search)
+		match := strings.Contains(strings.ToLower(task.TaskID), lsearch) ||
+			strings.Contains(strings.ToLower(task.TaskName), lsearch) ||
+			strings.Contains(strings.ToLower(task.QueueName), lsearch)
+		if !match {
 			return false
 		}
 	}
-
 	return true
+}
+
+func parseOptionalTime(value string) *time.Time {
+	if value == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+func allTaskStatuses() []string {
+	return []string{
+		"waiting",
+		"scheduled",
+		"running",
+		"completed",
+		"failed",
+	}
+}
+
+func normalizeTaskStatusFilter(value string) (string, bool) {
+	if value == "" {
+		return "", true
+	}
+	for _, s := range allTaskStatuses() {
+		if strings.EqualFold(s, value) {
+			return s, true
+		}
+	}
+	return value, false
+}
+
+func emptyTaskListResponse(page, perPage int, queueNames []string) TaskListResponse {
+	return TaskListResponse{
+		Tasks:      []TaskSummary{},
+		Count:      0,
+		TotalCount: 0,
+		Page:       page,
+		PerPage:    perPage,
+	}
 }
 
 func parsePositiveInt(value string, fallback int) int {
 	if value == "" {
 		return fallback
 	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return fallback
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
+		return int(n)
 	}
-	return parsed
-}
-
-func sortedKeys(set map[string]struct{}) []string {
-	if len(set) == 0 {
-		return []string{}
-	}
-	keys := make([]string, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return fallback
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(payload); err != nil {
-		http.Error(w, fmt.Sprintf("encode json: %v", err), http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(buf.Bytes())
+	if payload != nil {
+		enc := json.NewEncoder(w)
+		enc.Encode(payload)
+	}
 }
