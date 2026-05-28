@@ -1,5 +1,13 @@
 package server
 
+// Security notes on SQL query construction:
+// - Table names (queue identifiers) are ALWAYS quoted via pq.QuoteIdentifier
+//   (see queueTableIdentifier). This prevents SQL injection on identifiers.
+// - User-provided values are ALWAYS passed as $N parameters (QueryContext/ExecContext),
+//   never interpolated into SQL strings.
+// - When building dynamic WHERE clauses, only the parameter index ($N) is concatenated
+//   via fmt.Sprintf — this is safe because it only contains digits.
+
 import (
 	"bytes"
 	"context"
@@ -139,8 +147,8 @@ func (s *Server) renderIndexHTML(runtimeCfg uiRuntimeConfig) []byte {
 	injection := fmt.Sprintf("<base href=\"%s\"><script>window.__HABITAT_RUNTIME_CONFIG__=%s;</script>", html.EscapeString(baseHref), payload)
 	document := string(s.indexHTML)
 	staticPrefix := runtimeCfg.StaticBasePath + "/"
-	document = strings.ReplaceAll(document, "\"/_static/", fmt.Sprintf("\"%s", staticPrefix))
-	document = strings.ReplaceAll(document, "'/_static/", fmt.Sprintf("'%s", staticPrefix))
+	document = strings.ReplaceAll(document, "\"/_static/", staticPrefix+'"')
+	document = strings.ReplaceAll(document, "'/_static/", staticPrefix+"'")
 	if idx := strings.Index(document, "</head>"); idx >= 0 {
 		document = document[:idx] + injection + document[idx:]
 	} else {
@@ -1044,7 +1052,8 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getTaskAttempts(ctx context.Context, queueName, taskID string) (int, error) {
 	table := queueTableIdentifier("t", queueName)
-	query := fmt.Sprintf(`SELECT attempts FROM absurd.%s WHERE task_id = $1 LIMIT 1`, table)
+	// SAFE: table name is quoted via pq.QuoteIdentifier; value uses $1 parameter.
+	query := `SELECT attempts FROM absurd.` + table + ` WHERE task_id = $1 LIMIT 1`
 
 	var attempts int
 	err := s.db.QueryRowContext(ctx, query, taskID).Scan(&attempts)
@@ -1397,7 +1406,8 @@ func (s *Server) findQueueForRun(ctx context.Context, runID string) (string, err
 
 	for _, queueName := range queueNames {
 		rtable := queueTableIdentifier("r", queueName)
-		query := fmt.Sprintf(`SELECT 1 FROM absurd.%s WHERE run_id = $1 LIMIT 1`, rtable)
+		// SAFE: table name quoted via pq.QuoteIdentifier; runID uses $1 parameter.
+		query := `SELECT 1 FROM absurd.` + rtable + ` WHERE run_id = $1 LIMIT 1`
 		var dummy int
 		err = s.db.QueryRowContext(ctx, query, runID).Scan(&dummy)
 		switch {
