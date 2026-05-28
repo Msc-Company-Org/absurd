@@ -30,8 +30,10 @@ const (
 
 // Errors
 var (
-	ErrNoTaskContext = errors.New("absurd: no task context in context.Context")
-	ErrTaskNotFound  = errors.New("absurd: task not found")
+	ErrNoTaskContext        = errors.New("absurd: no task context in context.Context")
+	ErrTaskNotFound         = errors.New("absurd: task not found")
+	ErrInvalidOptionalArgs  = errors.New("absurd: first() called with more than 1 optional argument")
+	ErrRegistrationFailed   = errors.New("absurd: task registration failed")
 )
 
 var (
@@ -479,7 +481,7 @@ func (c *Client) getRegistration(taskName string) (registeredTask, bool) {
 
 func (c *Client) MustRegister(task taskRegistration) {
 	if err := c.Register(task); err != nil {
-		panic(err)
+		panic(fmt.Errorf("%w: %v", ErrRegistrationFailed, err))
 	}
 }
 
@@ -928,7 +930,7 @@ func first[T any](values []T) T {
 	case 1:
 		return values[0]
 	default:
-		panic(fmt.Sprintf("absurd: expected 0 or 1 optional arguments, got %d", len(values)))
+		panic(ErrInvalidOptionalArgs)
 	}
 }
 

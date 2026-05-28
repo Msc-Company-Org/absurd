@@ -134,7 +134,7 @@ func TaskFromContext(ctx context.Context) (*TaskContext, bool) {
 func MustTaskContext(ctx context.Context) *TaskContext {
 	taskCtx, ok := TaskFromContext(ctx)
 	if !ok {
-		panic(ErrNoTaskContext)
+		panic(fmt.Errorf("%w: context is not a task context", ErrNoTaskContext))
 	}
 	return taskCtx
 }
