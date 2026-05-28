@@ -1,6 +1,71 @@
-node_modules
-.venv
-.pi/todos
+# Absurd — .gitignore
+
+# === Language-specific ===
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.cover
+vendor/
 dist/
-.build/
+build/
+absurdctl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.eggs/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Node.js / TypeScript
+node_modules/
+*.log
+npm-debug.log*
+*.tsbuildinfo
+dist/
+build/
+
+# === IDE / OS ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# === Testing / Coverage ===
+coverage/
+*.cover
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# === Environment ===
+.env
+.env.local
+*.local
+
+# === Absurd-specific ===
+.pi/todos
 site/
+docs/_site/
+
+# === Misc ===
+*.log
