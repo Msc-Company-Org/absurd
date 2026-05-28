@@ -1,6 +1,15 @@
 #!/bin/sh
-dropdb absurd
-createdb absurd
-psql -d absurd -f ../../sql/absurd.sql
-#psql -d absurd -f ../../sql/absurd_clean.sql
-#psql -d absurd -c "select absurd.create('provisioning-demo');"
+# provision.sh — Create and seed the absurd demo database
+# Usage: ./provision.sh
+#
+# Requires: dropdb, createdb, psql (PostgreSQL client tools)
+set -euo pipefail
+
+dbname="${DB_NAME:-absurd}"
+sql_dir="$(cd "$(dirname "$0")/../../sql" && pwd)"
+
+dropdb "$dbname" 2>/dev/null || true
+createdb "$dbname"
+psql -d "$dbname" -f "$sql_dir/absurd.sql"
+
+echo "Database '$dbname' provisioned successfully."
